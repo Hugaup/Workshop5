@@ -77,9 +77,14 @@ export async function node(
     }
 
     while (!state.decided && !state.killed) {
+      if (state.k !== null && state.k > 100) {  // Add a maximum round limit
+        break;
+      }
       await phase1();
       await phase2();
-      if (!state.decided && !state.killed) state.k = (state.k as number) + 1;
+      if (!state.killed) {
+        state.k = (state.k as number) + 1;
+      }
       await delay(10);
     }
   }
@@ -89,7 +94,7 @@ export async function node(
     await sendToAll(1, state.x as Value, state.k as number);
     await waitFor(1);
     handlePhase1();
-    messagesPhase1[state.k as number] = []; // Clear messages after use
+    messagesPhase1[state.k as number] = [];
   }
 
   async function phase2() {
@@ -97,7 +102,7 @@ export async function node(
     await sendToAll(2, state.x as Value, state.k as number);
     await waitFor(2);
     handlePhase2();
-    messagesPhase2[state.k as number] = []; // Clear messages after use
+    messagesPhase2[state.k as number] = [];
   }
 
   async function sendToAll(phase: number, value: Value, k: number) {
@@ -136,10 +141,17 @@ export async function node(
     if (state.x === 0 || state.x === 1) count[state.x.toString()]++;
     for (const { value } of received) if (value === 0 || value === 1) count[value.toString()]++;
 
-    const majority = Math.floor(N / 2) + 1;
-    if (count["0"] >= majority) state.x = 0;
-    else if (count["1"] >= majority) state.x = 1;
-    else state.x = "?";
+    const majorityThreshold = N / 2 + 1;
+    const weakMajorityThreshold = Math.floor(N * 2 / 3) + 1;
+    
+    if (count["0"] >= majorityThreshold) state.x = 0;
+    else if (count["1"] >= majorityThreshold) state.x = 1;
+    else {
+      // Lower threshold for weak majority
+      if (count["0"] >= weakMajorityThreshold) state.x = 0;
+      else if (count["1"] >= weakMajorityThreshold) state.x = 1;
+      else state.x = Math.random() < 0.5 ? 0 : 1;
+    }
   }
 
   function handlePhase2() {
@@ -156,19 +168,33 @@ export async function node(
     }
 
     const nonFaulty = N - F;
-    const decisionT = Math.floor(nonFaulty / 2) + 1;
-    const adoptionT = Math.floor(nonFaulty / 3) + 1;
+    const decisionThreshold = Math.ceil(nonFaulty * 2 / 3);
+    const adoptionThreshold = Math.ceil(nonFaulty / 2);
 
-    if (count["0"] >= decisionT && state.x === 0) {
-      state.decided = true;
-    } else if (count["1"] >= decisionT && state.x === 1) {
-      state.decided = true;
-    } else if (count["0"] >= adoptionT) {
+    const totalVotes = count["0"] + count["1"] + count["?"];
+
+    if (totalVotes >= nonFaulty) {
+      if (count["0"] >= decisionThreshold) {
+        state.x = 0;
+        state.decided = true;
+        return;
+      } else if (count["1"] >= decisionThreshold) {
+        state.x = 1;
+        state.decided = true;
+        return;
+      }
+    }
+
+    // More relaxed adoption logic
+    if (count["0"] >= adoptionThreshold) {
       state.x = 0;
-    } else if (count["1"] >= adoptionT) {
+    } else if (count["1"] >= adoptionThreshold) {
       state.x = 1;
     } else {
-      state.x = Math.random() < 0.5 ? 0 : 1;
+      // Smarter randomization based on existing values
+      state.x = count["0"] > count["1"] ? 0 : 
+                count["1"] > count["0"] ? 1 : 
+                (Math.random() < 0.5 ? 0 : 1);
     }
   }
 
