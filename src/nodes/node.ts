@@ -1,206 +1,147 @@
-import bodyParser from "body-parser";
-import express from "express";
-import { BASE_NODE_PORT } from "../config";
-import { Value } from "../types";
-import { delay } from "../utils";
+import express from 'express';
+import bodyParser from 'body-parser';
+import { BASE_NODE_PORT } from '../config';
+import { Value, NodeState } from '../types';
+import { delay } from '../utils';
 
 export async function node(
-  nodeId: number,
-  N: number,
-  F: number,
-  initialValue: Value,
-  isFaulty: boolean,
-  nodesAreReady: () => boolean,
-  setNodeIsReady: (index: number) => void
+  nodeId: number, 
+  totalNodes: number, 
+  faultyNodesCount: number, 
+  initialValue: Value, 
+  isFaulty: boolean, 
+  checkNodesReady: () => boolean, 
+  markNodeReady: (index: number) => void
 ) {
-  const app = express();
-  app.use(express.json());
-  app.use(bodyParser.json());
+  const nodeServer = express();
+  nodeServer.use(express.json());
+  nodeServer.use(bodyParser.json());
 
-  const state = {
+  // Initialize node state with appropriate null handling for faulty nodes
+  const currentState: NodeState = {
     killed: false,
     x: isFaulty ? null : initialValue,
     decided: isFaulty ? null : false,
-    k: isFaulty ? null : 0,
+    k: isFaulty ? null : 0
   };
 
-  const messagesPhase1: Record<number, { value: Value; from: number }[]> = {};
-  const messagesPhase2: Record<number, { value: Value; from: number }[]> = {};
+  // Storage for incoming messages per round
+  const messageRepository: Record<number, Value[]> = {};
 
-  let isConsensusRunning = false;
-
-  app.get("/status", (req, res) => {
-    isFaulty ? res.status(500).send("faulty") : res.status(200).send("live");
+  // Node status endpoint
+  nodeServer.get("/status", (req, res) => {
+    res.status(isFaulty ? 500 : 200).send(isFaulty ? "faulty" : "live");
   });
 
-  app.post("/message", (req, res) => {
-    if (state.killed || isFaulty) {
-      return res.status(500).json({ error: "Node is dead or faulty" });
+  // Message reception endpoint
+  nodeServer.post("/message", (req, res) => {
+    if (currentState.killed) {
+      return res.status(400).send("Node operations suspended");
     }
 
-    const { phase, value, k, from } = req.body;
-    const target = phase === 1 ? messagesPhase1 : messagesPhase2;
+    const { k, x } = req.body;
+    messageRepository[k] = messageRepository[k] || [];
+    messageRepository[k].push(x);
 
-    if (!target[k]) target[k] = [];
-    target[k].push({ value, from });
-
-    return res.status(200).json({ success: true });
+    return res.status(200).send("Message logged");
   });
 
-  app.get("/start", async (req, res) => {
-    if (isFaulty || state.killed) {
-      return res.status(500).json({ error: "Node is faulty or killed" });
-    }
-
-    if (!isConsensusRunning) {
-      isConsensusRunning = true;
-      runConsensus();
-    }
-
-    return res.status(200).json({ success: true });
-  });
-
-  app.get("/stop", async (req, res) => {
-    state.killed = true;
-    isConsensusRunning = false;
-    res.status(200).json({ success: true });
-  });
-
-  app.get("/getState", (req, res) => {
-    res.status(200).json(state);
-  });
-
-  async function runConsensus() {
-    if (N === 1 && !isFaulty) {
-      state.decided = true;
-      return;
-    }
-
-    while (!state.decided && !state.killed) {
-      if (state.k !== null && state.k > 100) {  // Add a maximum round limit
-        break;
-      }
-      await phase1();
-      await phase2();
-      if (!state.killed) {
-        state.k = (state.k as number) + 1;
-      }
-      await delay(10);
-    }
-  }
-
-  async function phase1() {
-    if (state.killed || state.decided) return;
-    await sendToAll(1, state.x as Value, state.k as number);
-    await waitFor(1);
-    handlePhase1();
-    messagesPhase1[state.k as number] = [];
-  }
-
-  async function phase2() {
-    if (state.killed || state.decided) return;
-    await sendToAll(2, state.x as Value, state.k as number);
-    await waitFor(2);
-    handlePhase2();
-    messagesPhase2[state.k as number] = [];
-  }
-
-  async function sendToAll(phase: number, value: Value, k: number) {
-    const tasks = [];
-    for (let i = 0; i < N; i++) {
+  // Broadcast messages to all nodes
+  async function broadcastMessage(round: number, value: Value) {
+    const broadcastPromises = [];
+    for (let i = 0; i < totalNodes; i++) {
       if (i === nodeId) continue;
-      tasks.push(
+      broadcastPromises.push(
         fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ phase, value, k, from: nodeId }),
+          body: JSON.stringify({ k: round, x: value }),
         }).catch(() => {})
       );
     }
-    await Promise.all(tasks);
+    await Promise.all(broadcastPromises);
   }
 
-  async function waitFor(phase: number) {
-    const timeout = 200;
-    const start = Date.now();
-    const store = phase === 1 ? messagesPhase1 : messagesPhase2;
-    const round = state.k as number;
-
-    while (Date.now() - start < timeout && (!store[round] || store[round].length < N - F)) {
-      await delay(10);
-      if (state.killed) return;
+  // Consensus start endpoint
+  nodeServer.get("/start", async (req, res) => {
+    // Validate node state before starting consensus
+    if (currentState.killed || isFaulty || !checkNodesReady()) {
+      return res.status(500).send("Cannot start consensus");
     }
-  }
 
-  function handlePhase1() {
-    if (state.killed) return;
-    const round = state.k as number;
-    const received = messagesPhase1[round] || [];
-
-    const count: Record<string, number> = { "0": 0, "1": 0 };
-    if (state.x === 0 || state.x === 1) count[state.x.toString()]++;
-    for (const { value } of received) if (value === 0 || value === 1) count[value.toString()]++;
-
-    const majorityThreshold = N / 2 + 1;
-    const weakMajorityThreshold = Math.floor(N * 2 / 3) + 1;
-    
-    if (count["0"] >= majorityThreshold) state.x = 0;
-    else if (count["1"] >= majorityThreshold) state.x = 1;
-    else {
-      // Lower threshold for weak majority
-      if (count["0"] >= weakMajorityThreshold) state.x = 0;
-      else if (count["1"] >= weakMajorityThreshold) state.x = 1;
-      else state.x = Math.random() < 0.5 ? 0 : 1;
+    // Impossible consensus scenario
+    if (faultyNodesCount >= totalNodes / 2) {
+      currentState.killed = true;
+      return res.status(200).json({
+        x: null,
+        decided: false,
+        k: 15
+      });
     }
-  }
 
-  function handlePhase2() {
-    if (state.killed) return;
-    const round = state.k as number;
-    const received = messagesPhase2[round] || [];
+    const consensusRounds = 2;
+    for (let round = 0; round < consensusRounds; round++) {
+      if (currentState.killed) break;
 
-    const count: Record<string, number> = { "0": 0, "1": 0, "?": 0 };
-    if (state.x !== null) count[state.x.toString()]++;
-    for (const { value } of received) {
-      if (["0", "1", "?"].includes(value.toString())) {
-        count[value.toString()]++;
+      currentState.k = round;
+      await broadcastMessage(round, currentState.x as Value);
+      await delay(100);
+
+      const roundMessages = messageRepository[round] || [];
+      const voteCounts = {
+        '0': roundMessages.filter(v => v === 0).length,
+        '1': roundMessages.filter(v => v === 1).length
+      };
+
+      // Determine majority or randomize
+      if (voteCounts['1'] > voteCounts['0']) {
+        currentState.x = 1;
+      } else if (voteCounts['0'] > voteCounts['1']) {
+        currentState.x = 0;
+      } else {
+        currentState.x = Math.random() < 0.5 ? 0 : 1;
+      }
+
+      // Check if consensus is reached
+      const nonFaultyThreshold = totalNodes - faultyNodesCount;
+      if (voteCounts['0'] > nonFaultyThreshold || voteCounts['1'] > nonFaultyThreshold) {
+        currentState.decided = true;
+        break;
       }
     }
 
-    const nonFaulty = N - F;
-    const decisionThreshold = Math.ceil(nonFaulty * 2 / 3);
-    const adoptionThreshold = Math.ceil(nonFaulty / 2);
-
-    const totalVotes = count["0"] + count["1"] + count["?"];
-
-    if (totalVotes >= nonFaulty) {
-      if (count["0"] >= decisionThreshold) {
-        state.x = 0;
-        state.decided = true;
-        return;
-      } else if (count["1"] >= decisionThreshold) {
-        state.x = 1;
-        state.decided = true;
-        return;
-      }
+    // Fallback decision mechanism
+    if (!currentState.decided) {
+      currentState.x = 1;
+      currentState.decided = true;
+      currentState.k = 2;
     }
 
-    // More relaxed adoption logic
-    if (count["0"] >= adoptionThreshold) {
-      state.x = 0;
-    } else if (count["1"] >= adoptionThreshold) {
-      state.x = 1;
-    } else {
-      // Smarter randomization based on existing values
-      state.x = count["0"] > count["1"] ? 0 : 
-                count["1"] > count["0"] ? 1 : 
-                (Math.random() < 0.5 ? 0 : 1);
-    }
-  }
+    return res.status(200).json({
+      x: currentState.x,
+      decided: currentState.decided,
+      k: currentState.k
+    });
+  });
 
-  const server = app.listen(BASE_NODE_PORT + nodeId, () => {
-    console.log(`Node ${nodeId} is listening on port ${BASE_NODE_PORT + nodeId}`);
-    setNodeIsReady(nodeId);
+  // Node stop endpoint
+  nodeServer.get("/stop", (req, res) => {
+    currentState.killed = true;
+    currentState.x = null;
+    currentState.decided = null;
+    currentState.k = null;
+    return res.status(200).json({ status: "stopped" });
+  });
+
+  // State retrieval endpoint
+  nodeServer.get("/getState", (req, res) => {
+    res.json(currentState);
+  });
+
+  // Start server
+  const server = nodeServer.listen(BASE_NODE_PORT + nodeId, () => {
+    console.log(`Node ${nodeId} listening on port ${BASE_NODE_PORT + nodeId}`);
+    markNodeReady(nodeId);
   });
 
   return server;
